@@ -2,13 +2,13 @@ name: Hot News Crawler
 
 on:
   schedule:
-    # 北京时间 08:00 / 12:00 / 18:00 （UTC 分别为 00:00 / 04:00 / 10:00）
+    # 北京时间 08:00 / 12:00 / 18:00 （UTC：00:00 / 04:00 / 10:00）
     - cron: "0 0 * * *"
     - cron: "0 4 * * *"
     - cron: "0 10 * * *"
   workflow_dispatch:
 
-# 同一分支只允许一个实例并发，避免互相覆盖
+# 防并发互撞
 concurrency:
   group: auto-update-${{ github.ref }}
   cancel-in-progress: false
@@ -24,7 +24,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0  # 为 rebase 准备完整历史
+          fetch-depth: 0   # 需要完整历史以便合并/回退
+
+      - name: Sync to latest (hard reset)
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          git fetch origin "$BRANCH_NAME"
+          git reset --hard "origin/$BRANCH_NAME"
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -39,12 +47,8 @@ jobs:
       - name: Verify required files
         run: |
           echo "🔍 检查必需的配置文件..."
-          if [ ! -f config/config.yaml ]; then
-            echo "❌ 错误: config/config.yaml 文件不存在"; exit 1
-          fi
-          if [ ! -f config/frequency_words.txt ]; then
-            echo "❌ 错误: config/frequency_words.txt 文件不存在"; exit 1
-          fi
+          [ -f config/config.yaml ] || { echo "❌ 缺少 config/config.yaml"; exit 1; }
+          [ -f config/frequency_words.txt ] || { echo "❌ 缺少 config/frequency_words.txt"; exit 1; }
           echo "✅ 配置文件检查通过"
 
       - name: Run crawler
@@ -67,7 +71,7 @@ jobs:
 
       - name: Commit and push if changes
         env:
-          BRANCH_NAME: ${{ github.ref_name }}   # 自动识别当前分支（master/main 均可）
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
           set -e
           git config --global user.name 'GitHub Actions'
@@ -80,13 +84,11 @@ jobs:
 
           git commit -m "Auto update by GitHub Actions at $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
 
-          # 关键：先同步再推送，避免 “fetch first”
-          git pull --rebase --autostash origin "$BRANCH_NAME"
+          # 与远端自动合并：冲突优先保留本次运行产物（ours）
+          git pull --no-rebase -X ours --no-edit origin "$BRANCH_NAME" || true
 
-          # 推送带一次重试，进一步稳妥
+          # 推送；若被抢先提交阻塞，则带 lease 的安全强推重试一次
           if ! git push origin "$BRANCH_NAME"; then
-            echo "⚠️ 首次推送失败，重试一次..."
-            sleep 3
-            git pull --rebase --autostash origin "$BRANCH_NAME"
-            git push origin "$BRANCH_NAME"
+            echo "⚠️ 普通推送失败，尝试 --force-with-lease ..."
+            git push --force-with-lease origin "$BRANCH_NAME"
           fi
